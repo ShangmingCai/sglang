@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import random
 from collections import deque
 from contextlib import nullcontext
@@ -370,11 +369,21 @@ class CustomizedInfoError(ValueError):
     pass
 
 
-class MetadataBuffers:
-    # Positions of output_customized_info and output_customized_info_len in
-    # get_buf_infos; the PD layout check compares only these strides.
-    CUSTOMIZED_INFO_SLOTS = slice(6, 8)
+# Per-request slot carrying the first output token's customized_info from
+# prefill to decode: a 4-byte length header followed by a msgpack payload.
+# Fixed so that prefill and decode always agree on the slot stride.
+CUSTOMIZED_INFO_SLOT_BYTES = 4096
+_CUSTOMIZED_INFO_HEADER_BYTES = 4
 
+
+def _customized_info_enc_hook(obj: object) -> object:
+    # Sampler tensors may live on the GPU or require grad.
+    if isinstance(obj, torch.Tensor):
+        obj = obj.detach().cpu()
+    return enc_hook(obj)
+
+
+class MetadataBuffers:
     def __init__(
         self,
         size: int,
@@ -390,19 +399,6 @@ class MetadataBuffers:
         self.custom_mem_pool = custom_mem_pool
         self.output_dsa_topk_indices_dim = output_dsa_topk_indices_dim
         self.enable_sampling_mask = envs.SGLANG_ENABLE_DISAGG_SAMPLING_MASK.get()
-        customized_info_capacity_env = envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES
-        customized_info_capacity = (
-            customized_info_capacity_env.parse(
-                os.environ[customized_info_capacity_env.name]
-            )
-            if customized_info_capacity_env.is_set()
-            else customized_info_capacity_env.get()
-        )
-        if customized_info_capacity <= 0:
-            raise ValueError(
-                f"{customized_info_capacity_env.name} must be positive "
-                f"(got {customized_info_capacity})"
-            )
         bootstrap_room_dtype = torch.uint64
         device = "cpu"
         if is_npu():
@@ -441,10 +437,7 @@ class MetadataBuffers:
                 (size, max_top_logprobs_num), dtype=torch.int32, device=device
             )
             self.output_customized_info = torch.zeros(
-                (size, customized_info_capacity), dtype=torch.uint8, device=device
-            )
-            self.output_customized_info_len = torch.zeros(
-                (size, 16), dtype=torch.int32, device=device
+                (size, CUSTOMIZED_INFO_SLOT_BYTES), dtype=torch.uint8, device=device
             )
             self.output_token_sampling_mask_len = None
             self.output_token_sampling_mask_idx = None
@@ -514,7 +507,6 @@ class MetadataBuffers:
             self.output_top_logprobs_val,
             self.output_top_logprobs_idx,
             self.output_customized_info,
-            self.output_customized_info_len,
             self.output_token_sampling_mask_len,
             self.output_token_sampling_mask_idx,
             self.output_token_sampling_logprobs,
@@ -528,10 +520,6 @@ class MetadataBuffers:
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
         bufs = [buf for buf in bufs if buf is not None]
-        assert bufs[self.CUSTOMIZED_INFO_SLOTS] == [
-            self.output_customized_info,
-            self.output_customized_info_len,
-        ]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
         item_lens = [buf[0].nbytes for buf in bufs]
@@ -571,49 +559,39 @@ class MetadataBuffers:
             self.bootstrap_room[idx].clone(),
         )
 
-    def get_customized_info(self, idx: int) -> dict[str, list[object]] | None:
-        length = int(self.output_customized_info_len[idx, 0].item())
-        if not 0 <= length <= self.output_customized_info.shape[1]:
-            raise ValueError(f"Invalid disaggregation customized_info length: {length}")
+    def get_customized_info(self, idx: int) -> Optional[dict]:
+        slot = self.output_customized_info[idx].cpu()
+        length = int(slot[:_CUSTOMIZED_INFO_HEADER_BYTES].view(torch.int32)[0])
         if length == 0:
             return None
-        payload = self.output_customized_info[idx, :length].cpu().numpy().tobytes()
-        return msgspec.msgpack.decode(
-            payload, type=dict[str, list[object]], ext_hook=ext_hook
-        )
+        payload = slot[_CUSTOMIZED_INFO_HEADER_BYTES:][:length].numpy().tobytes()
+        return msgspec.msgpack.decode(payload, ext_hook=ext_hook)
 
-    def set_buf(self, req: Req):
+    def _set_customized_info(self, idx: int, info: Optional[dict]):
         try:
             payload = (
-                b""
-                if req.customized_info is None
-                else msgspec.msgpack.encode(
-                    req.customized_info,
-                    enc_hook=lambda obj: enc_hook(
-                        obj.detach().cpu() if isinstance(obj, torch.Tensor) else obj
-                    ),
-                )
+                msgspec.msgpack.encode(info, enc_hook=_customized_info_enc_hook)
+                if info
+                else b""
             )
-            if payload:
-                # Reject schema errors before they can abort the decode scheduler.
-                msgspec.msgpack.decode(
-                    payload, type=dict[str, list[object]], ext_hook=ext_hook
-                )
         except (TypeError, ValueError, OverflowError) as exc:
             raise CustomizedInfoError(f"Invalid customized_info: {exc}") from exc
-        if len(payload) > self.output_customized_info.shape[1]:
+        capacity = CUSTOMIZED_INFO_SLOT_BYTES - _CUSTOMIZED_INFO_HEADER_BYTES
+        if len(payload) > capacity:
             raise CustomizedInfoError(
-                f"customized_info payload ({len(payload)} bytes) exceeds "
-                "disaggregation metadata capacity "
-                f"({self.output_customized_info.shape[1]} bytes). Increase "
-                "SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES on both prefill and decode."
+                f"customized_info for the first output token is {len(payload)} "
+                f"bytes, over the {capacity}-byte disaggregation metadata slot"
             )
-        idx = req.metadata_buffer_index
+        slot = self.output_customized_info[idx]
+        slot[:_CUSTOMIZED_INFO_HEADER_BYTES].view(torch.int32)[0] = len(payload)
         if payload:
-            self.output_customized_info[idx, : len(payload)].copy_(
-                torch.from_numpy(np.frombuffer(payload, dtype=np.uint8).copy())
+            slot[_CUSTOMIZED_INFO_HEADER_BYTES:][: len(payload)].copy_(
+                torch.frombuffer(bytearray(payload), dtype=torch.uint8)
             )
-        self.output_customized_info_len[idx, 0] = len(payload)
+
+    def set_buf(self, req: Req):
+        # First, so an invalid payload aborts the request before any write.
+        self._set_customized_info(req.metadata_buffer_index, req.customized_info)
 
         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token

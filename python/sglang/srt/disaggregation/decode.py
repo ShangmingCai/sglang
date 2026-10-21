@@ -2466,6 +2466,16 @@ def alloc_for_decode_prealloc(
     return kv_loc
 
 
+def _merge_customized_info(req: Req, info: Optional[dict]) -> None:
+    """Fold the prefill-sampled first token's customized_info into req."""
+    if not info:
+        return
+    if req.customized_info is None:
+        req.customized_info = {}
+    for key, values in info.items():
+        req.customized_info.setdefault(key, []).extend(values)
+
+
 def _generate_fake_prefill_handoff_output_id(req: Req) -> int:
     """Generate a deterministic synthetic handoff token for fake-PD requests.
 
@@ -2619,13 +2629,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.is_rebootstrap
             and decode_req.req.pd_rebootstrap_forced_output_id is not None
         )
-        if not replayed_boundary and not _is_fake_transfer(decode_req.req):
-            customized_info = self.metadata_buffers.get_customized_info(idx)
-            if customized_info is not None:
-                if decode_req.req.customized_info is None:
-                    decode_req.req.customized_info = {}
-                for key, values in customized_info.items():
-                    decode_req.req.customized_info.setdefault(key, []).extend(values)
         if replayed_boundary:
             committed_output_id = decode_req.req.pd_rebootstrap_forced_output_id
             decode_req.req.pd_rebootstrap_forced_output_id = None
@@ -2635,6 +2638,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
         else:
             committed_output_id = output_id[0].item()
+            _merge_customized_info(
+                decode_req.req, self.metadata_buffers.get_customized_info(idx)
+            )
         decode_req.req.output_ids.append(committed_output_id)
         if not replayed_boundary:
             # The handoff token is generated on the prefill worker, so it does

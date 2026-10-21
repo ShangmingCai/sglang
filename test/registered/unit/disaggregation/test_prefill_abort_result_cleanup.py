@@ -96,8 +96,8 @@ def _free_req(req, _tree_cache, *, checkpoint):
 
 @pytest.mark.parametrize(
     "customized_info",
-    [{"scores": ["x" * 8192]}, {"scores": [object()]}, {1: [0.5]}],
-    ids=["overflow", "encoding", "non-string-key"],
+    [{"scores": ["x" * 8192]}, {"scores": [object()]}],
+    ids=["overflow", "encoding"],
 )
 @patch("sglang.srt.disaggregation.prefill.poll_and_all_reduce_attn_cp_tp_group")
 @patch("sglang.srt.disaggregation.prefill.release_kv_cache")

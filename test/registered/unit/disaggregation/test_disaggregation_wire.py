@@ -1,6 +1,4 @@
 import concurrent.futures
-import os
-import struct
 import threading
 import unittest
 from collections import defaultdict
@@ -31,13 +29,13 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 )
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
-    KVArgsRegisterInfo,
     MooncakeKVManager,
     MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import (
+    CustomizedInfoError,
     MetadataBuffers,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -200,7 +198,6 @@ class TestDisaggregationWire(unittest.TestCase):
                                 dst_state_layer_ids=[layer_ids, layer_ids],
                                 dst_attn_tp_size=1,
                                 dst_aux_ptrs=[0x6000],
-                                dst_aux_item_lens=[8],
                             )
                         )
                         queue.put(
@@ -619,140 +616,6 @@ class TestDisaggregationWire(unittest.TestCase):
                     ack.assert_called_once_with(42, target)
                     manager._maybe_ack_drained_abort(42)
                     ack.assert_called_once()
-
-    def test_mooncake_registration_parses_optional_aux_item_lens(self):
-        msg = [
-            b"room",
-            b"127.0.0.1",
-            b"1234",
-            b"session",
-            struct.pack("Q", 0x1000),
-            struct.pack("Q", 0x2000),
-            b"",
-            b"0",
-            b"1",
-            b"128",
-            b"",
-            b"",
-            b"",
-            b"",
-            struct.pack("Q", 0x3000),
-            b"4096",
-            b"4",
-            b"2",
-            b"",
-            struct.pack("Q", 128),
-        ]
-        self.assertIsNone(KVArgsRegisterInfo.from_zmq(msg).dst_aux_item_lens)
-        info = KVArgsRegisterInfo.from_zmq(msg + [struct.pack("Q", 4096)])
-        self.assertEqual(info.dst_kv_item_lens, [128])
-        self.assertEqual(info.dst_aux_item_lens, [4096])
-
-    def test_aux_buffer_validation_allows_decode_only_speculation(self):
-        """Non-spec prefill and EAGLE decode have different hidden-state strides."""
-        prefill = MetadataBuffers(1, 16, torch.float32, 0)
-        decode = MetadataBuffers(1, 128, torch.float16, 0)
-        src_ptrs, _, src_lens = prefill.get_buf_infos()
-        dst_ptrs, _, dst_lens = decode.get_buf_infos()
-        manager = object.__new__(CommonKVManager)
-        manager.kv_args = SimpleNamespace(
-            aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
-        )
-        self.assertNotEqual(src_lens, dst_lens)
-        manager.validate_aux_buffers(dst_ptrs, dst_lens)
-        for local_lens, peer_ptrs, peer_lens in (
-            (src_lens, dst_ptrs, dst_lens[:6] + [2048] + dst_lens[7:]),
-            (src_lens, dst_ptrs, dst_lens[:6] + [8192] + dst_lens[7:]),
-            (src_lens, dst_ptrs, dst_lens[:7] + [32] + dst_lens[8:]),
-            (src_lens, dst_ptrs[:-1], dst_lens[:-1]),
-            (src_lens, dst_ptrs, dst_lens[:-1]),
-            (src_lens, dst_ptrs, []),
-            (src_lens[:-1], dst_ptrs, dst_lens),
-            (src_lens, dst_ptrs, None),
-        ):
-            with self.subTest(local_lens=local_lens, peer_lens=peer_lens):
-                manager.kv_args.aux_item_lens = local_lens
-                with self.assertRaisesRegex(
-                    ValueError, "metadata buffer layout mismatch"
-                ):
-                    manager.validate_aux_buffers(peer_ptrs, peer_lens)
-
-    def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
-        manager = object.__new__(MooncakeKVManager)
-        manager.kv_args = SimpleNamespace(
-            aux_data_ptrs=[0x1000] * 8,
-            aux_item_lens=[64] * 6 + [4096, 64],
-            kv_data_ptrs=[0x2000],
-        )
-        manager.enable_trace = manager.enable_staging = False
-        manager.enable_deferred_decode_kv_release = False
-        manager.bootstrap_port = 1234
-        manager.failure_lock = manager.session_lock = threading.Lock()
-        manager.failure_records = {}
-        manager.failed_sessions = set()
-        manager.state_layout_rejections = {}
-        manager._deferred_ack_targets = {}
-        manager._staging_outstanding = defaultdict(int)
-        manager.req_to_decode_prefix_len = {}
-        manager.request_status = {room: KVPoll.WaitingForInput for room in (21, 22)}
-        manager.transfer_infos = {
-            room: {
-                str(room): TransferInfo(
-                    room=room,
-                    endpoint="127.0.0.1",
-                    dst_port=5555,
-                    mooncake_session_id=str(room),
-                    dst_kv_indices=np.array([], dtype=np.int32),
-                    dst_aux_index=0,
-                    dst_state_indices=[],
-                    required_dst_info_num=1,
-                    is_dummy=False,
-                )
-            }
-            for room in (21, 22)
-        }
-        manager.decode_kv_args_table = {
-            str(room): SimpleNamespace(
-                dst_aux_ptrs=[0x3000] * 8,
-                dst_aux_item_lens=[64] * 6 + [2048 if room == 21 else 4096, 64],
-                requires_dcp_relayout=False,
-            )
-            for room in (21, 22)
-        }
-        manager._prefill_unique_rank = Mock(return_value=0)
-        manager._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
-        manager.send_kv_status_message = Mock()
-        manager.send_aux = Mock(return_value=0)
-        chunks = [
-            TransferKVChunk(
-                room=room,
-                prefill_kv_indices=np.array([], dtype=np.int32),
-                index_slice=slice(0, 0),
-                is_last_chunk=True,
-                chunk_id=0,
-                prefill_aux_index=0,
-                state_indices=None,
-            )
-            for room in (21, 22)
-        ]
-
-        manager.transfer_worker(
-            SimpleNamespace(get=Mock(side_effect=[*chunks, None])), None
-        )
-
-        self.assertEqual(manager.request_status[21], KVPoll.Failed)
-        self.assertIn("metadata buffer layout mismatch", manager.failure_records[21])
-        self.assertEqual(manager.request_status[22], KVPoll.Success)
-        manager.send_aux.assert_called_once()
-        self.assertEqual(manager.send_aux.call_args.args[0].room, 22)
-        self.assertEqual(
-            [
-                call.kwargs["status"]
-                for call in manager.send_kv_status_message.call_args_list
-            ],
-            [KVPoll.Failed, KVPoll.Success],
-        )
-        self.assertEqual(dict(manager._staging_outstanding), {})
 
     def test_prebuilt_skips_unused_prompt_tensor(self):
         req = SimpleNamespace(
@@ -1833,39 +1696,41 @@ class TestEagleDsaSeedTransfer(CustomTestCase):
                 buffers.set_buf(req)
                 req.customized_info = value
                 buffers.set_buf(req)
-                self.assertEqual(buffers.get_customized_info(0), value)
+                self.assertIsNone(buffers.get_customized_info(0))
 
-    def test_customized_info_capacity_override_and_overflow(self):
-        with patch.dict(os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES="8192"):
-            buffers = self._make_buffers()
-        req = self._make_req(None)
-        req.customized_info = {"payload": ["x" * 5000]}
-        buffers.set_buf(req)
-        self.assertEqual(buffers.get_customized_info(0), req.customized_info)
-        req.customized_info = {"payload": ["x" * 8192]}
-        with self.assertRaisesRegex(ValueError, "exceeds disaggregation"):
-            buffers.set_buf(req)
-
-    def test_customized_info_tensor_roundtrip(self):
+    def test_customized_info_roundtrip(self):
         buffers = self._make_buffers()
         req = self._make_req(None)
         tensor = torch.tensor([0.25, 0.5], dtype=torch.bfloat16, requires_grad=True)
-        req.customized_info = {"tensor": [tensor]}
+        req.customized_info = {
+            "tensor": [tensor],
+            "scalar": [torch.tensor(7)],
+            "nested": [{"ids": [1, 2]}],
+            3: ["non-string key"],
+        }
         buffers.set_buf(req)
-        restored = buffers.get_customized_info(0)["tensor"][0]
-        torch.testing.assert_close(restored, tensor.detach())
-        self.assertEqual(restored.device.type, "cpu")
+        restored = buffers.get_customized_info(0)
+        torch.testing.assert_close(restored["tensor"][0], tensor.detach())
+        self.assertEqual(restored["tensor"][0].device.type, "cpu")
+        self.assertEqual(restored["scalar"][0].shape, torch.Size([]))
+        self.assertEqual(restored["nested"], [{"ids": [1, 2]}])
+        self.assertEqual(restored[3], ["non-string key"])
 
-    def test_customized_info_capacity_rejects_invalid_values(self):
-        for capacity in ("0", "many"):
-            with (
-                self.subTest(capacity=capacity),
-                patch.dict(
-                    os.environ, SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES=capacity
-                ),
-            ):
-                with self.assertRaises(ValueError):
-                    self._make_buffers()
+    def test_customized_info_rejects_oversized_and_unencodable(self):
+        buffers = self._make_buffers()
+        req = self._make_req(None)
+        capacity = buffers.output_customized_info.shape[1] - 4
+        req.customized_info = {"x": [b"\0" * (capacity - 16)]}
+        buffers.set_buf(req)
+        self.assertEqual(buffers.get_customized_info(0), req.customized_info)
+        for info, error in (
+            ({"x": [b"\0" * capacity]}, "over the"),
+            ({"x": [object()]}, "Invalid customized_info"),
+        ):
+            with self.subTest(error=error):
+                req.customized_info = info
+                with self.assertRaisesRegex(CustomizedInfoError, error):
+                    buffers.set_buf(req)
 
     def test_sampling_mask_metadata_is_opt_in(self):
         """Disabled masks stay off the wire; enabled masks round-trip at capacity."""
