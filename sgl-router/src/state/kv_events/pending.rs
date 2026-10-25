@@ -150,18 +150,19 @@ impl PendingPrefixes {
         if !self.is_enabled() || hashes.is_empty() {
             return;
         }
+        // Charge the DEEPEST record of the stake the request matched: the
+        // block that is specific to this prompt. The leading blocks (a shared
+        // system prompt, say) are owned by every stake on the worker, and
+        // charging them would cap every conversation on the worker at once.
         let state = self.state.read();
-        let mut charged = false;
-        for hash in hashes {
-            match state.owner(*hash, url) {
-                Some(owner) => {
-                    owner.followers.fetch_add(1, Ordering::Relaxed);
-                    charged = true;
-                }
-                None => break,
-            }
-        }
-        if charged {
+        let tail = hashes
+            .iter()
+            .map(|hash| state.owner(*hash, url))
+            .take_while(Option::is_some)
+            .last()
+            .flatten();
+        if let Some(owner) = tail {
+            owner.followers.fetch_add(1, Ordering::Relaxed);
             self.followed.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -253,18 +254,11 @@ impl PendingPrefixes {
             let owners = state.by_hash.get(hash).map_or(&[][..], Vec::as_slice);
             let live = |o: &Owner| o.expiry_ms.load(Ordering::Relaxed) > now_ms;
             if i == 0 {
-                // A stake at its follower cap is invisible: the walk never
-                // starts on it, so the worker gets no pending depth at all.
-                let (open, at_cap): (Vec<_>, Vec<_>) = owners
+                walking = owners
                     .iter()
                     .filter(|o| live(o))
-                    .partition(|o| {
-                        max_followers == 0 || o.followers.load(Ordering::Relaxed) < max_followers
-                    });
-                if !at_cap.is_empty() {
-                    self.capped.fetch_add(1, Ordering::Relaxed);
-                }
-                walking = open.into_iter().map(|o| (Arc::clone(&o.url), 1)).collect();
+                    .map(|o| (Arc::clone(&o.url), 1))
+                    .collect();
             } else {
                 let (held, stopped): (Vec<_>, Vec<_>) = walking
                     .into_iter()
@@ -277,6 +271,21 @@ impl PendingPrefixes {
             }
         }
         done.extend(walking);
+        if max_followers == 0 {
+            return done;
+        }
+        // A stake at its follower cap is invisible. The cap lives on the
+        // deepest block the prompt matched (see `record_follow`), so a capped
+        // burst prefix hides only itself, not the worker's other stakes.
+        let before = done.len();
+        done.retain(|(url, depth)| {
+            state
+                .owner(hashes[depth - 1], url)
+                .is_none_or(|o| o.followers.load(Ordering::Relaxed) < max_followers)
+        });
+        if done.len() < before {
+            self.capped.fetch_add(1, Ordering::Relaxed);
+        }
         done
     }
 }
@@ -319,6 +328,29 @@ mod tests {
         pending.record("b", &[1, 2]);
         assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("b".into(), 2)]);
         assert_eq!(pending.capped(), 2);
+    }
+
+    #[test]
+    fn cap_is_charged_on_the_deepest_block_not_the_shared_prefix() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.set_max_followers(2);
+        // Two conversations on "a" share blocks 1,2 (a system prompt).
+        pending.record("a", &[1, 2, 3]);
+        pending.record("a", &[1, 2, 9]);
+        // A burst on the first conversation's prefix reaches the cap...
+        pending.record_follow("a", &[1, 2, 3]);
+        pending.record_follow("a", &[1, 2, 3, 4]);
+        assert!(pending.depths(&[1, 2, 3]).is_empty());
+        // ...but the other conversation on the same worker is untouched,
+        // and so is a prompt that only shares the system prompt.
+        assert_eq!(sorted(pending.depths(&[1, 2, 9])), [("a".into(), 3)]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 7])), [("a".into(), 2)]);
+        // A longer turn of the capped conversation matches past the capped
+        // block once its own tail is staked, so the conversation itself
+        // keeps following its stake.
+        pending.record("a", &[1, 2, 3, 4]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3, 4])), [("a".into(), 4)]);
     }
 
     #[test]
