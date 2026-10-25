@@ -26,6 +26,12 @@ const MAX_RECORDS: usize = 1 << 20;
 pub struct PendingPrefixes {
     ttl_ms: AtomicU64,
     hits: AtomicU64,
+    /// Max requests one stake may attract before it stops counting; 0 = no cap.
+    max_followers: AtomicU64,
+    /// Requests routed to a worker because of its pending stake.
+    followed: AtomicU64,
+    /// Lookups where a stake was ignored because it had reached the cap.
+    capped: AtomicU64,
     /// Expiries are milliseconds since this, so a refresh is one atomic store.
     epoch: Instant,
     state: RwLock<State>,
@@ -36,6 +42,9 @@ impl Default for PendingPrefixes {
         Self {
             ttl_ms: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            max_followers: AtomicU64::new(0),
+            followed: AtomicU64::new(0),
+            capped: AtomicU64::new(0),
             epoch: Instant::now(),
             state: RwLock::default(),
         }
@@ -46,6 +55,8 @@ impl Default for PendingPrefixes {
 struct Owner {
     url: Arc<str>,
     expiry_ms: AtomicU64,
+    /// Requests this stake has already attracted (see `max_followers`).
+    followers: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -113,6 +124,48 @@ impl PendingPrefixes {
         self.hits.load(Ordering::Relaxed)
     }
 
+    /// Cap on requests one stake may attract; 0 disables the cap.
+    pub fn set_max_followers(&self, max: u64) {
+        self.max_followers.store(max, Ordering::Relaxed);
+    }
+
+    pub fn max_followers(&self) -> u64 {
+        self.max_followers.load(Ordering::Relaxed)
+    }
+
+    pub fn followed(&self) -> u64 {
+        self.followed.load(Ordering::Relaxed)
+    }
+
+    pub fn capped(&self) -> u64 {
+        self.capped.load(Ordering::Relaxed)
+    }
+
+    /// A request was routed to `url` because of its pending stake on
+    /// `hashes`: charge every live owner record of that stake one follower.
+    /// Once a record reaches the cap, [`Self::depths`] stops reporting the
+    /// stake, so later requests fall through to the confirmed tree and then
+    /// to the load policy instead of piling onto one worker.
+    pub fn record_follow(&self, url: &str, hashes: &[i64]) {
+        if !self.is_enabled() || hashes.is_empty() {
+            return;
+        }
+        let state = self.state.read();
+        let mut charged = false;
+        for hash in hashes {
+            match state.owner(*hash, url) {
+                Some(owner) => {
+                    owner.followers.fetch_add(1, Ordering::Relaxed);
+                    charged = true;
+                }
+                None => break,
+            }
+        }
+        if charged {
+            self.followed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn record_hit(&self) {
         self.hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -160,6 +213,7 @@ impl PendingPrefixes {
                     owners.push(Owner {
                         url: Arc::clone(&url),
                         expiry_ms: AtomicU64::new(expiry),
+                        followers: AtomicU64::new(0),
                     });
                     state.fifo.push_back((expiry, hash, Arc::clone(&url)));
                 }
@@ -191,6 +245,7 @@ impl PendingPrefixes {
             return Vec::new();
         }
         let now_ms = self.millis(now);
+        let max_followers = self.max_followers();
         let state = self.state.read();
         let mut walking: Vec<(Arc<str>, usize)> = Vec::new();
         let mut done = Vec::new();
@@ -198,11 +253,18 @@ impl PendingPrefixes {
             let owners = state.by_hash.get(hash).map_or(&[][..], Vec::as_slice);
             let live = |o: &Owner| o.expiry_ms.load(Ordering::Relaxed) > now_ms;
             if i == 0 {
-                walking = owners
+                // A stake at its follower cap is invisible: the walk never
+                // starts on it, so the worker gets no pending depth at all.
+                let (open, at_cap): (Vec<_>, Vec<_>) = owners
                     .iter()
                     .filter(|o| live(o))
-                    .map(|o| (Arc::clone(&o.url), 1))
-                    .collect();
+                    .partition(|o| {
+                        max_followers == 0 || o.followers.load(Ordering::Relaxed) < max_followers
+                    });
+                if !at_cap.is_empty() {
+                    self.capped.fetch_add(1, Ordering::Relaxed);
+                }
+                walking = open.into_iter().map(|o| (Arc::clone(&o.url), 1)).collect();
             } else {
                 let (held, stopped): (Vec<_>, Vec<_>) = walking
                     .into_iter()
@@ -236,6 +298,41 @@ mod tests {
         let pending = PendingPrefixes::default();
         pending.record("a", &[1, 2]);
         assert!(pending.depths(&[1, 2]).is_empty());
+    }
+
+    #[test]
+    fn follower_cap_hides_a_stake_and_counts_it() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.set_max_followers(2);
+        pending.record("a", &[1, 2, 3]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("a".into(), 3)]);
+        pending.record_follow("a", &[1, 2, 3]);
+        assert_eq!(pending.followed(), 1);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("a".into(), 3)]);
+        pending.record_follow("a", &[1, 2, 3, 4]);
+        assert_eq!(pending.followed(), 2);
+        // At the cap: the stake is invisible, counted once per lookup.
+        assert!(pending.depths(&[1, 2, 3]).is_empty());
+        assert_eq!(pending.capped(), 1);
+        // Another worker's stake on the same prefix is unaffected.
+        pending.record("b", &[1, 2]);
+        assert_eq!(sorted(pending.depths(&[1, 2, 3])), [("b".into(), 2)]);
+        assert_eq!(pending.capped(), 2);
+    }
+
+    #[test]
+    fn no_cap_by_default_and_follow_of_unknown_stake_is_free() {
+        let pending = PendingPrefixes::default();
+        pending.enable(Duration::from_secs(60));
+        pending.record("a", &[1, 2]);
+        for _ in 0..100 {
+            pending.record_follow("a", &[1, 2]);
+        }
+        assert_eq!(sorted(pending.depths(&[1, 2])), [("a".into(), 2)]);
+        pending.record_follow("zzz", &[1, 2]);
+        assert_eq!(pending.followed(), 100);
+        assert_eq!(pending.capped(), 0);
     }
 
     #[test]

@@ -404,6 +404,10 @@ fn build_app_context(
     if let Some(cache) = config.model.cache_aware.as_ref() {
         let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
         engine_state.tree().pending().enable(ttl);
+        engine_state
+            .tree()
+            .pending()
+            .set_max_followers(cache.pending_prefix_max_followers);
     }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();

@@ -528,6 +528,9 @@ pub struct CacheAwareConfig {
     /// How long a routed prompt credits its worker before KV events confirm
     /// it; 0 disables.
     pub pending_prefix_ttl_ms: u64,
+    /// Max requests one pending stake may attract before later requests fall
+    /// through to the confirmed tree and the load policy; 0 = unlimited.
+    pub pending_prefix_max_followers: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -539,6 +542,7 @@ impl Default for CacheAwareConfig {
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
+            pending_prefix_max_followers: 0,
         }
     }
 }

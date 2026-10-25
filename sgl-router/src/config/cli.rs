@@ -354,6 +354,14 @@ pub struct CacheArgs {
     #[arg(long)]
     pub cache_pending_prefix_ttl_ms: Option<u64>,
 
+    /// Max requests one pending stake may attract within its TTL. Past the
+    /// cap the stake is ignored, so a burst sharing a cold prefix stops
+    /// piling onto one worker and falls through to the confirmed KV-event
+    /// tree, then to the load policy. 0 (default) leaves it unbounded.
+    /// Requires --cache-pending-prefix-ttl-ms.
+    #[arg(long)]
+    pub cache_pending_prefix_max_followers: Option<u64>,
+
     /// External KV indexer gRPC endpoint used as the authoritative cache signal.
     /// Needs an explicit scheme, e.g. `http://10.0.0.1:50051`.
     #[arg(long)]
@@ -916,6 +924,11 @@ impl CacheArgs {
                     && cache_prefix_provider == CachePrefixProvider::RadixTree),
             "--cache-pending-prefix-ttl-ms requires --policy cache_aware with the radix_tree prefix provider"
         );
+        ensure!(
+            self.cache_pending_prefix_max_followers.is_none()
+                || self.cache_pending_prefix_ttl_ms.is_some(),
+            "--cache-pending-prefix-max-followers requires --cache-pending-prefix-ttl-ms"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -954,6 +967,7 @@ impl CacheArgs {
                 .unwrap_or(DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS),
             bootstrap_seed_required: self.kv_bootstrap_seed_required,
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
+            pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
         }))
     }
 }
@@ -3027,6 +3041,29 @@ mod tests {
             .expect("native cache-aware needs its default configuration");
         assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
         assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn pending_prefix_max_followers_rides_on_the_ttl() {
+        let cache = cfg_of(
+            "--policy cache_aware --cache-pending-prefix-ttl-ms 500 \
+             --cache-pending-prefix-max-followers 8",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        assert_eq!(cache.pending_prefix_max_followers, 8);
+        let unset = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(unset.pending_prefix_max_followers, 0, "unbounded by default");
+        let err = cfg_of("--policy cache_aware --cache-pending-prefix-max-followers 8")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--cache-pending-prefix-max-followers"), "{err}");
     }
 
     #[test]
