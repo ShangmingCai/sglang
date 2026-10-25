@@ -193,6 +193,27 @@ pub struct ServerArgs {
     /// Log output format.
     #[arg(long, value_enum, default_value = "text")]
     pub log_format: LogFormat,
+
+    /// Base URL of the theoretical cache-sim service (e.g.
+    /// `http://cache-sim:9095`). When set, each request's
+    /// ingress ids are teed to its `/ingest_ids` and each completed chat
+    /// response's rendered reply to `/extend_ids`, best-effort and
+    /// fire-and-forget. Unset disables the tee. Also read from
+    /// `RADIXARK_CACHE_SIM_URL`.
+    #[arg(long, env = "RADIXARK_CACHE_SIM_URL")]
+    pub cache_sim_url: Option<String>,
+
+    /// Max concurrent streaming captures the cache-sim / token-export extend
+    /// tee holds (each buffers up to 16 MiB). Only meaningful with
+    /// `--cache-sim-url` or `--token-export-s3-uri`.
+    #[arg(long, default_value_t = crate::config::default_cache_sim_max_concurrent_captures())]
+    pub cache_sim_max_concurrent_captures: usize,
+
+    /// `s3://bucket/prefix` of the token dataset export (NDJSON, gzip). Needs
+    /// `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION`. Unset
+    /// disables it. Also read from `RADIXARK_TOKEN_EXPORT_S3_URI`.
+    #[arg(long, env = "RADIXARK_TOKEN_EXPORT_S3_URI")]
+    pub token_export_s3_uri: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -630,6 +651,9 @@ impl Cli {
             observability: ObservabilityConfig {
                 log_level: self.server.log_level,
                 log_format: self.server.log_format,
+                cache_sim_url: self.server.cache_sim_url,
+                cache_sim_max_concurrent_captures: self.server.cache_sim_max_concurrent_captures,
+                token_export_s3_uri: self.server.token_export_s3_uri,
             },
             model: ModelConfig {
                 tokenizer_path: (!self.model.no_tokenizer).then(|| {

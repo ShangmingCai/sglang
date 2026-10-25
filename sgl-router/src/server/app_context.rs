@@ -68,6 +68,11 @@ pub struct AppContext {
     /// responses_total), the chat handler (worker_requests_total), the
     /// active-load registry, policy-specific counters, and PD dispatch.
     pub metrics: Arc<MetricsRegistry>,
+    /// Best-effort tee of ingress ids / completed replies to the theoretical
+    /// cache-sim; `None` unless `--cache-sim-url` is set.
+    pub cache_sim_tee: Option<Arc<crate::server::cache_sim_tee::CacheSimTee>>,
+    /// Token-export sink to S3; `None` unless `--token-export-s3-uri` is set.
+    pub s3_export_sink: Option<Arc<crate::server::s3_export::S3ExportSink>>,
     /// Shared Engine LoadStat table; ingress captures one immutable snapshot per request.
     pub engine_reported_load: Arc<EngineReportedLoadTable>,
     pub prefix_index: Option<Arc<dyn sgl_kv_indexer::PrefixIndex>>,
@@ -131,6 +136,35 @@ impl AppContext {
         policies.attach_metrics(Arc::clone(&metrics));
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
+        let max_captures = config.observability.cache_sim_max_concurrent_captures;
+        let cache_sim_tee = config
+            .observability
+            .cache_sim_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| {
+                crate::server::cache_sim_tee::CacheSimTee::spawn(
+                    url.to_owned(),
+                    Arc::clone(&metrics),
+                    max_captures,
+                )
+            });
+        let s3_export_sink = config
+            .observability
+            .token_export_s3_uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty())
+            .and_then(|uri| {
+                let pod = std::env::var("POD_NAME").unwrap_or_else(|_| "unknown-pod".to_owned());
+                crate::server::s3_export::S3ExportSink::spawn(
+                    uri,
+                    pod,
+                    Arc::clone(&metrics),
+                    max_captures,
+                )
+            });
         Self {
             config,
             tokenizers,
@@ -142,6 +176,8 @@ impl AppContext {
             router_inflight_load,
             decode_gate,
             metrics,
+            cache_sim_tee,
+            s3_export_sink,
             prefix_index: None,
             radix_tree_prefix_provider: None,
             dp_rank_prefix_provider: None,
@@ -258,6 +294,8 @@ impl AppContext {
             kv_index: None,
             engine_reported_load: EngineReportedLoadTable::new(),
             inflight_http: InflightHttp::new(),
+            cache_sim_tee: None,
+            s3_export_sink: None,
             readiness: AtomicU8::new(READINESS_NOT_READY),
         }
     }
