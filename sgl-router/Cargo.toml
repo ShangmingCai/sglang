@@ -99,6 +99,10 @@ rmp-serde = "1"
 # src/policies/kv_events/tree.rs.
 rustc-hash = "2"
 sha2 = "0.10"
+# S3 token export (SigV4 signing + record timestamps), see src/server/s3_export.rs.
+hmac = "0.12"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 

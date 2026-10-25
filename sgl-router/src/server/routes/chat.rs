@@ -5,6 +5,7 @@ mod forward;
 mod openai;
 mod preparation;
 mod reorg;
+mod tee;
 
 use crate::buckets_reorg::BucketResolver;
 use crate::config::{SessionAffinityMode, DEFAULT_MIN_LOAD_CHOICES};
@@ -114,7 +115,14 @@ async fn serve_http(
 ) -> Result<Response<Body>, ApiError> {
     let start = Instant::now();
     let (request, routing) = prepare(&ctx, endpoint, &headers, body, false).await?;
-    routing.dispatch(&ctx, request, headers, start).await
+    // Observational tees (cache-sim / token export): planned before the
+    // request is consumed, fired only once it reached a worker.
+    let tee = tee::TeePlan::new(&ctx, endpoint, &request, &headers);
+    let response = routing.dispatch(&ctx, request, headers, start).await?;
+    Ok(match tee {
+        Some(tee) => tee.after_dispatch(&ctx, response),
+        None => response,
+    })
 }
 
 /// A gRPC call whose request is `endpoint`'s HTTP body, sent to the engine as `rpc`.

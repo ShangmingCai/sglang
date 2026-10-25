@@ -160,7 +160,24 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
-    let outcome = serve(listener, grpc_listener, app_context, sigterm, sigint).await;
+    let outcome = serve(
+        listener,
+        grpc_listener,
+        Arc::clone(&app_context),
+        sigterm,
+        sigint,
+    )
+    .await;
+
+    // After draining in-flight requests, flush the S3 token-export queue so a
+    // rolling restart does not lose records. Capped, so the whole shutdown
+    // stays inside the pod's termination grace period.
+    if let Some(sink) = app_context.s3_export_sink.as_ref() {
+        let budget = Duration::from_secs(config.server.shutdown_drain_secs.min(60));
+        if tokio::time::timeout(budget, sink.drain()).await.is_err() {
+            tracing::warn!(budget_secs = budget.as_secs(), "s3 export drain timed out");
+        }
+    }
 
     // Stop background tasks once the HTTP server has finished draining.
     discovery_handle.abort();

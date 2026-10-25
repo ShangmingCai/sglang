@@ -352,6 +352,21 @@ pub struct ObservabilityConfig {
     pub log_level: String,
     /// Tracing output format.
     pub log_format: LogFormat,
+    /// Base URL of the theoretical cache-sim service;
+    /// `None` disables the ingest/extend tees. See `crate::server::cache_sim_tee`.
+    pub cache_sim_url: Option<String>,
+    /// Max concurrent response captures held for the extend tee; each may
+    /// buffer up to `cache_sim_extend::MAX_EXTEND_CAPTURE_BYTES`.
+    pub cache_sim_max_concurrent_captures: usize,
+    /// `s3://bucket/prefix` for the token-export sink; `None` disables it.
+    /// See `crate::server::s3_export`.
+    pub token_export_s3_uri: Option<String>,
+}
+
+/// 256 captures x 16 MiB = 4 GiB worst case of capture memory; comfortable
+/// for normal streaming concurrency, small next to a router memory limit.
+pub fn default_cache_sim_max_concurrent_captures() -> usize {
+    256
 }
 
 /// `text` for human-readable dev output, `json` for one-line-per-record
@@ -374,6 +389,9 @@ impl Default for ObservabilityConfig {
         Self {
             log_level: default_log_level(),
             log_format: LogFormat::default(),
+            cache_sim_url: None,
+            cache_sim_max_concurrent_captures: default_cache_sim_max_concurrent_captures(),
+            token_export_s3_uri: None,
         }
     }
 }

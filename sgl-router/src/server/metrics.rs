@@ -473,6 +473,14 @@ pub struct MetricsRegistry {
     stale_requests_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     decode_affinity_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
     sticky_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    /// `sgl_router_cache_sim_tee_total{result}` — ingest/extend tee outcomes.
+    cache_sim_tee_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    /// `sgl_router_s3_export_total{result}` — token-export sink outcomes.
+    s3_export_total: Mutex<HashMap<&'static str, Arc<AtomicU64>>>,
+    /// NDJSON records successfully uploaded by the token-export sink.
+    s3_export_records_uploaded: AtomicU64,
+    /// Extend tees whose prompt/output boundary was impossible and dropped.
+    cache_sim_boundary_impossible_total: AtomicU64,
     policy_decisions_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     policy_selection_failures_total: Mutex<HashMap<PolicyDecisionKey, Arc<AtomicU64>>>,
     cache_admission_evaluated_total: AtomicU64,
@@ -778,6 +786,45 @@ impl MetricsRegistry {
             .clone();
         drop(guard);
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_cache_sim_boundary_impossible_total`.
+    pub fn record_cache_sim_boundary_impossible(&self) {
+        self.cache_sim_boundary_impossible_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_cache_sim_tee_total{result}`. `result` is a fixed
+    /// `&'static str`, so label cardinality is bounded regardless of traffic.
+    pub fn record_cache_sim_tee(&self, result: &'static str) {
+        let mut guard = self.cache_sim_tee_total.lock();
+        let counter = guard
+            .entry(result)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Bump `sgl_router_s3_export_total{result}` (enqueued|dropped_queue_full|
+    /// dropped_capture_capped|dropped_upload_backlog|dropped_closed|object_put|
+    /// put_failed|drain_flushed).
+    pub fn record_s3_export(&self, result: &'static str) {
+        let mut guard = self.s3_export_total.lock();
+        let counter = guard
+            .entry(result)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)))
+            .clone();
+        drop(guard);
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add `n` to `sgl_router_s3_export_records_uploaded_total` — the NDJSON
+    /// record count of a successfully uploaded S3 object. Compare against
+    /// `s3_export_total{result="enqueued"}` (records-in) to detect silent loss.
+    pub fn add_s3_export_records_uploaded(&self, n: u64) {
+        self.s3_export_records_uploaded
+            .fetch_add(n, Ordering::Relaxed);
     }
 
     /// Record the final Prefill policy decision.
@@ -1241,6 +1288,61 @@ impl MetricsRegistry {
             ));
         }
         drop(guard);
+
+        // cache_sim_tee_total
+        out.push_str(
+            "# HELP sgl_router_cache_sim_tee_total Best-effort cache-sim tee outcomes (result=sent|http_error|error|dropped|closed for the ingress /ingest_ids tee, extend_* for the response /extend_ids tee, capture_capped when a response capture was shed).\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_sim_tee_total counter\n");
+        let guard = self.cache_sim_tee_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (result, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_cache_sim_tee_total{{result=\"{}\"}} {}\n",
+                result, value,
+            ));
+        }
+        drop(guard);
+
+        // s3_export_total
+        out.push_str(
+            "# HELP sgl_router_s3_export_total Token-export S3 sink outcomes (result=enqueued|dropped_queue_full|dropped_capture_capped|dropped_upload_backlog|dropped_closed|object_put|put_failed|drain_flushed).\n",
+        );
+        out.push_str("# TYPE sgl_router_s3_export_total counter\n");
+        let guard = self.s3_export_total.lock();
+        let mut entries: Vec<(&&str, u64)> = guard
+            .iter()
+            .map(|(k, v)| (k, v.load(Ordering::Relaxed)))
+            .collect();
+        entries.sort_by_key(|e| *e.0);
+        for (result, value) in entries {
+            out.push_str(&format!(
+                "sgl_router_s3_export_total{{result=\"{}\"}} {}\n",
+                result, value,
+            ));
+        }
+        drop(guard);
+        out.push_str(
+            "# HELP sgl_router_s3_export_records_uploaded_total Records (NDJSON lines) successfully uploaded to S3 by the token export sink.\n",
+        );
+        out.push_str("# TYPE sgl_router_s3_export_records_uploaded_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_s3_export_records_uploaded_total {}\n",
+            self.s3_export_records_uploaded.load(Ordering::Relaxed)
+        ));
+        out.push_str(
+            "# HELP sgl_router_cache_sim_boundary_impossible_total Extend tees whose prompt/output boundary could not be true; the boundary is dropped and the sequence sent insert-only.\n",
+        );
+        out.push_str("# TYPE sgl_router_cache_sim_boundary_impossible_total counter\n");
+        out.push_str(&format!(
+            "sgl_router_cache_sim_boundary_impossible_total {}\n",
+            self.cache_sim_boundary_impossible_total
+                .load(Ordering::Relaxed)
+        ));
 
         // policy_decisions_total
         out.push_str(
