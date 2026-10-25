@@ -531,7 +531,15 @@ pub struct CacheAwareConfig {
     /// Max requests one pending stake may attract before later requests fall
     /// through to the confirmed tree and the load policy; 0 = unlimited.
     pub pending_prefix_max_followers: u64,
+    /// Consult and stake pending prefixes only while the confirmed KV-event
+    /// match covers less than this share of the prompt; 1.0 = always.
+    pub pending_prefix_consult_below: f64,
 }
+
+/// Pending prefixes are consulted only while the confirmed match covers less
+/// than half the prompt: a conversation turn whose history the KV events have
+/// confirmed routes on that match and needs no stake; a cold prefix does.
+pub const DEFAULT_PENDING_PREFIX_CONSULT_BELOW: f64 = 0.5;
 
 impl Default for CacheAwareConfig {
     fn default() -> Self {
@@ -543,6 +551,7 @@ impl Default for CacheAwareConfig {
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
+            pending_prefix_consult_below: DEFAULT_PENDING_PREFIX_CONSULT_BELOW,
         }
     }
 }

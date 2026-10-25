@@ -400,7 +400,14 @@ fn build_app_context(
             .cache_aware
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    .then(|| {
+        let provider =
+            RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
+        match config.model.cache_aware.as_ref() {
+            Some(cache) => provider.with_pending_consult_below(cache.pending_prefix_consult_below),
+            None => provider,
+        }
+    });
     if let Some(cache) = config.model.cache_aware.as_ref() {
         let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
         engine_state.tree().pending().enable(ttl);

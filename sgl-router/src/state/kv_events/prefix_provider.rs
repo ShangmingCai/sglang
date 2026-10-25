@@ -24,6 +24,13 @@ pub struct PrefixLookupResult {
 pub struct RadixTreePrefixProvider {
     tree: Arc<HashTree>,
     block_size_oracle: Arc<BlockSizeOracle>,
+    /// Consult and stake pending prefixes only while the confirmed KV-event
+    /// match covers less than this share of the prompt. Above it the
+    /// confirmed tree already routes the prompt and its successor turns, so
+    /// the pending walk and the stake write are skipped: the request pays
+    /// nothing for a tier it cannot benefit from. `f64::INFINITY` means
+    /// always (the pre-gate behavior).
+    pending_consult_below: f64,
 }
 
 impl RadixTreePrefixProvider {
@@ -31,7 +38,15 @@ impl RadixTreePrefixProvider {
         Self {
             tree,
             block_size_oracle,
+            pending_consult_below: f64::INFINITY,
         }
+    }
+
+    /// Only consult and stake pending prefixes when the confirmed match
+    /// covers less than `ratio` of the prompt (see `pending_consult_below`).
+    pub fn with_pending_consult_below(mut self, ratio: f64) -> Self {
+        self.pending_consult_below = ratio;
+        self
     }
 
     pub fn match_request_tokens(
@@ -53,7 +68,18 @@ impl RadixTreePrefixProvider {
         }
         let confirmed = depth_by_url.values().copied().max();
         let confirmed_by_url = depth_by_url.clone();
-        let pending = self.tree.pending().depths(&hashes);
+        // Pay for the pending tier only when the confirmed tree has not
+        // already placed this prompt: a cold prefix (first turn, or a turn
+        // racing its predecessor's KV events) is the only case a stake can
+        // decide, and the only case a stake must be written for the next turn.
+        let covered = confirmed.unwrap_or(0) as f64 / hashes.len() as f64;
+        let consult_pending =
+            self.tree.pending().is_enabled() && covered < self.pending_consult_below;
+        let pending = if consult_pending {
+            self.tree.pending().depths(&hashes)
+        } else {
+            Vec::new()
+        };
         let pending_best = pending
             .iter()
             .map(|(_, depth)| u32::try_from(*depth).unwrap_or(u32::MAX))
@@ -94,7 +120,7 @@ impl RadixTreePrefixProvider {
             outcome,
             query_blocks: hashes.len(),
             pending_winners,
-            block_hashes: self.tree.pending().is_enabled().then(|| hashes.into()),
+            block_hashes: consult_pending.then(|| hashes.into()),
         })
     }
 
@@ -268,6 +294,39 @@ mod tests {
             [("http://a".into(), 3), ("http://b".into(), 10)]
         );
         assert!(signal.pending_winners.is_empty());
+    }
+
+    #[test]
+    fn warm_prompt_skips_the_pending_tier_and_its_stake() {
+        let provider = provider(60_000, 0).with_pending_consult_below(0.5);
+        let prompt = tokens(10);
+        // A cold prompt (nothing confirmed) consults the tier and is staked.
+        let cold = lookup(&provider, &prompt);
+        assert!(cold.block_hashes.is_some(), "a cold prompt is staked");
+        provider.record_route(&cold, "http://b");
+        // Once a confirmed match covers at least half the prompt, the deeper
+        // stake on b is not even consulted, and the prompt writes no stake.
+        confirm(&provider, "http://a", &prompt, 6);
+        let warm = lookup(&provider, &prompt);
+        assert_eq!(depths(&warm), [("http://a".into(), 6)]);
+        assert!(warm.pending_winners.is_empty());
+        assert!(warm.block_hashes.is_none(), "a warm prompt pays no stake");
+        assert_eq!(provider.tree.pending().hits(), 0, "the tier was never walked");
+    }
+
+    #[test]
+    fn cold_prompt_below_the_gate_still_uses_the_stake() {
+        let provider = provider(60_000, 0).with_pending_consult_below(0.5);
+        let prompt = tokens(10);
+        // Only the shared head is confirmed: 2 of 10 blocks, below the gate.
+        confirm(&provider, "http://a", &prompt, 2);
+        let first = lookup(&provider, &prompt);
+        assert!(first.block_hashes.is_some());
+        provider.record_route(&first, "http://b");
+        let next = lookup(&provider, &prompt);
+        assert_eq!(next.pending_winners, vec!["http://b".to_string()]);
+        assert_eq!(depths(&next), [("http://a".into(), 2), ("http://b".into(), 10)]);
+        assert_eq!(provider.tree.pending().hits(), 1);
     }
 
     #[test]
